@@ -8,37 +8,52 @@ import math
 import yaml
 from shapely.geometry import Polygon
 import pyclipper
+import argparse 
 
 
-# --- configuration
 TRITON_URL = "localhost:8000"
 DET_MODEL_NAME = "ocr_ml_detector"
-REC_MODEL_NAME = "ocr_en_recogniser"
-
 DET_INPUT_NAME = "x"
 DET_OUTPUT_NAME = "fetch_name_0"
-REC_INPUT_NAME = "x"
-REC_OUTPUT_NAME = "fetch_name_0"
 
-IMAGE_PATH = "sample.png"
-CHARACTER_DICT_PATH = "dicts/en_dict.txt"
+# Language specific configurations
+LANG_CONFIG = {
+    'en': {
+        'rec_model_name': 'ocr_en_recogniser',
+        'rec_input_name': 'x',
+        'rec_output_name': 'fetch_name_0',
+        'dict_path': 'dicts/en_dict.txt',
+        'rec_img_h': 48
+    },
+    'ja': {
+        'rec_model_name': 'ocr_ja_recogniser',
+        'rec_input_name': 'x',
+        'rec_output_name': 'fetch_name_0',
+        'dict_path': 'dicts/japan_dict.txt',
+        'rec_img_h': 48
+    },
+    # 'ko': {
+    #     'rec_model_name': 'ocr_ko_recogniser',
+    #     'rec_input_name': 'x',            # Verify with Netron
+    #     'rec_output_name': 'fetch_name_0', # Verify with Netron
+    #     'dict_path': 'dicts/korean_dict.txt',
+    #     'rec_img_h': 48                   # Standard height for PP-OCRv3 Rec
+    # }
+    # Add other languages here if needed
+}
 
-# --- Preprocessing parameters
+# Preprocessing/Postprocessing constants (can be kept global or moved into LANG_CONFIG if they differ)
 DET_MAX_SIDE_LEN = 960
-REC_IMG_H = 48
 DET_IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 DET_IMG_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 REC_IMG_MEAN = 0.5
 REC_IMG_STD = 0.5
-
-# --- Postprocessing parameters
 DET_DB_THRESH = 0.3
 DET_DB_BOX_THRESH = 0.6
 DET_DB_UNCLIP_RATIO = 1.5
 DET_BOX_TYPE = 'quad'
 MIN_BOX_AREA = 10
 MIN_BOX_SCORE = 0.5
-
 
 def load_character_dict(dict_path):
     char_list = []
@@ -48,7 +63,9 @@ def load_character_dict(dict_path):
     char_list = ['<blank>'] + char_list
     char_map = {char: i for i, char in enumerate(char_list)}
     print(f"Loaded dictionary: {len(char_list)} chars, first 10: {char_list[:10]}")
+    print(char_map)
     return char_list, char_map
+
 
 def preprocess_det_image(img, max_side_len=DET_MAX_SIDE_LEN):
     h, w, _ = img.shape
@@ -72,15 +89,14 @@ def preprocess_det_image(img, max_side_len=DET_MAX_SIDE_LEN):
     img_batch = np.expand_dims(img_transposed, axis=0)
     return img_batch, (ratio, h, w)
 
-
-def preprocess_rec_image(img_crop, rec_img_h=REC_IMG_H):
-    h,w,_ = img_crop.shape
+def preprocess_rec_image(img_crop, rec_img_h):
+    h, w, _ = img_crop.shape
     ratio = rec_img_h / float(h)
-    resize_w = int(w* ratio)
+    resize_w = int(w * ratio)
     resize_w = max(32, int(round(resize_w / 4) * 4))
     resized_img = cv2.resize(img_crop, (resize_w, rec_img_h))
     img_normalized = (resized_img.astype(np.float32) / 255.0 - REC_IMG_MEAN) / REC_IMG_STD
-    img_transposed = img_normalized.transpose((2,0,1))
+    img_transposed = img_normalized.transpose((2, 0, 1))
     img_batch = np.expand_dims(img_transposed, axis=0)
     return img_batch
 
@@ -94,6 +110,14 @@ def postprocess_recognition(rec_output_raw, char_list):
         print(f"Error: Unexpected recognition output shape: {rec_output_raw.shape}")
         return "Decoding Error", 0.0
     
+    # ===>>> DEBUGGING: Print raw probabilities shape and max indices <<<===
+    print(f"  [Debug Rec] Raw preds shape: {preds.shape}") # e.g., (SeqLen, 97)
+    pred_indices = np.argmax(preds, axis=1)
+    print(f"  [Debug Rec] Indices with max prob per step: {pred_indices}")
+    pred_probs = np.max(preds, axis=1)
+    print(f"  [Debug Rec] Max prob per step: {pred_probs}")
+    # ===>>> END DEBUGGING <<<===
+    
     pred_indices = np.argmax(preds, axis=1)
     pred_probs = np.max(preds, axis=1)
 
@@ -106,10 +130,22 @@ def postprocess_recognition(rec_output_raw, char_list):
             decoded_probs.append(pred_probs[i])
         last_idx = idx
     
+     # ===>>> DEBUGGING: Print indices after CTC decode <<<===
+    print(f"  [Debug Rec] Indices after CTC decode: {decoded_indices}")
+    # Print corresponding chars for these indices BEFORE joining
+    intermediate_chars = [char_list[i] if 0 < i < len(char_list) else f'INVALID_IDX({i})' for i in decoded_indices]
+    print(f"  [Debug Rec] Intermediate chars: {intermediate_chars}")
+    # ===>>> END DEBUGGING <<<===
+
     text = "".join([char_list[i] for i in decoded_indices if 0 < i < len(char_list)])
     confidence = np.mean(decoded_probs) if decoded_probs else 0.0
 
+    # ===>>> DEBUGGING: Print final text <<<===
+    print(f"  [Debug Rec] Final decoded text: '{text}'")
+    # ===>>> END DEBUGGING <<<===
+
     return text, float(confidence)
+
 
 class DBPostProcess:
     def __init__(self,
@@ -241,61 +277,142 @@ class DBPostProcess:
                 if scores[i] >= MIN_BOX_SCORE:
                     final_boxes.append(box.tolist())
         return final_boxes
-    
+
+
+def order_points_clockwise(pts):
+    """ Sorts 4 points defining a quadrilateral in clockwise order:
+        top-left, top-right, bottom-right, bottom-left """
+    # Ensure input is numpy array
+    pts = np.array(pts, dtype="float32")
+
+    # Sort the points based on their x-coordinates
+    xSorted = pts[np.argsort(pts[:, 0]), :]
+
+    # Grab the left-most and right-most points from the sorted
+    # x-coordinate points
+    leftMost = xSorted[:2, :]
+    rightMost = xSorted[2:, :]
+
+    # Now, sort the left-most coordinates according to their y-coordinates
+    # so we can grab the top-left and bottom-left points, respectively
+    leftMost = leftMost[np.argsort(leftMost[:, 1]), :]
+    (tl, bl) = leftMost
+
+    # Now, sort the right-most coordinates according to their y-coordinates
+    # to get the top-right and bottom-right points
+    # Use distance from top-left to break ties / handle vertical lines better
+    # We want the point further from tl to be bottom-right
+    D = np.linalg.norm(rightMost - tl, axis=1)
+    rightMost = rightMost[np.argsort(D)[::-1], :] # Sort descending by distance
+    (br, tr) = rightMost
+
+    # Return the coordinates in top-left, top-right,
+    # bottom-right, and bottom-left order
+    return np.array([tl, tr, br, bl], dtype="float32")
 
 def get_rotate_crop_image(img, points):
+    """ Crops image patch based on polygon points, handling rotation
+        and ensuring correct orientation. """
     assert len(points) == 4, "Points number must be 4"
-    img_crop_width = int(max(np.linalg.norm(points[0] - points[1]),
-                             np.linalg.norm(points[2] - points[3])))
-    img_crop_height = int(max(np.linalg.norm(points[0] - points[3]),
-                              np.linalg.norm(points[1] - points[2])))
-    pts_std = np.float32([[0, 0], [img_crop_width, 0], [img_crop_width, img_crop_height], [0, img_crop_height]])
-    points_float = np.array(points, dtype=np.float32)
-    M = cv2.getPerspectiveTransform(points_float, pts_std)
-    dst_img = cv2.warpPerspective(img, M, (img_crop_width, img_crop_height), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC)
-    dst_img_h, dst_img_w = dst_img.shape[0:2]
-    if dst_img_h * 1.0 / dst_img_w >= 1.5:
-        dst_img = np.rot90(dst_img, k=3)
+
+    # *** Ensure consistent clockwise order ***
+    ordered_points = order_points_clockwise(points)
+    # *** Use ordered_points from here on ***
+
+    # Calculate width and height based on the ordered points
+    # Width is max distance between top-left/top-right and bottom-left/bottom-right
+    width_A = np.linalg.norm(ordered_points[0] - ordered_points[1])
+    width_B = np.linalg.norm(ordered_points[3] - ordered_points[2])
+    img_crop_width = int(max(width_A, width_B))
+
+    # Height is max distance between top-left/bottom-left and top-right/bottom-right
+    height_A = np.linalg.norm(ordered_points[0] - ordered_points[3])
+    height_B = np.linalg.norm(ordered_points[1] - ordered_points[2])
+    img_crop_height = int(max(height_A, height_B))
+
+    # Define standard destination points (top-left, top-right, bottom-right, bottom-left)
+    pts_std = np.float32([[0, 0], [img_crop_width, 0],
+                          [img_crop_width, img_crop_height], [0, img_crop_height]])
+
+    # Calculate the perspective transform matrix using ordered points
+    M = cv2.getPerspectiveTransform(ordered_points, pts_std)
+
+    # Check if width or height is zero or negative before warp
+    if img_crop_width <= 0 or img_crop_height <= 0:
+        print(f"Warning: Invalid crop dimensions ({img_crop_width}x{img_crop_height}). Skipping crop.")
+        return None # Return None to indicate failure
+
+    # Apply the perspective warp
+    dst_img = cv2.warpPerspective(img, M, (img_crop_width, img_crop_height),
+                                  borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_CUBIC)
+
+    # *** REMOVE the heuristic vertical text rotation for now ***
+    # It might interfere, let's ensure horizontal text is correct first.
+    # # Handle vertical text: Rotate 90 degrees clockwise if height > width
+    # dst_img_h, dst_img_w = dst_img.shape[0:2]
+    # if dst_img_h * 1.0 / dst_img_w >= 1.5:
+    #     dst_img = np.rot90(dst_img, k=3)
+
     return dst_img
 
-
+# === Main Execution ===
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Triton OCR Client")
+    parser.add_argument('--image', type=str, required=True, help='Path to the input image file.')
+    parser.add_argument('--lang', type=str, required=True, choices=LANG_CONFIG.keys(), help='Target language code (e.g., en, ja, ko).')
+    parser.add_argument('--triton_url', type=str, default=TRITON_URL, help='Triton server URL (e.g., localhost:8000).')
+    args = parser.parse_args()
+ 
+    TARGET_LANG = args.lang
+    if TARGET_LANG not in LANG_CONFIG:
+        print(f"Error: Unsupported language '{TARGET_LANG}'. Supported: {list(LANG_CONFIG.keys())}")
+        exit()
 
-    # --- Load image
+    IMAGE_PATH = args.image
+    TRITON_URL = args.triton_url
+    lang_specific_config = LANG_CONFIG[TARGET_LANG]
+    REC_MODEL_NAME = lang_specific_config['rec_model_name']
+    REC_INPUT_NAME = lang_specific_config['rec_input_name']
+    REC_OUTPUT_NAME = lang_specific_config['rec_output_name']
+    CHARACTER_DICT_PATH = lang_specific_config['dict_path']
+    REC_IMG_H = lang_specific_config['rec_img_h']
+
+    print(f"Using Language: {TARGET_LANG}")
+    print(f"Recognizer Model: {REC_MODEL_NAME}")
+    print(f"Dictionary: {CHARACTER_DICT_PATH}")
+
+    # Load image
     img_orig = cv2.imread(IMAGE_PATH)
     if img_orig is None:
         print(f"Error loading image: {IMAGE_PATH}")
         exit()
     print(f"Original image shape: {img_orig.shape}")
 
-
     # --- Load character dictionary
     if not os.path.exists(CHARACTER_DICT_PATH):
         print(f"Error: Character dictionary not found at {CHARACTER_DICT_PATH}")
         exit()
-    char_list = char_map = load_character_dict(CHARACTER_DICT_PATH)
+    char_list, char_map = load_character_dict(CHARACTER_DICT_PATH)
 
-    # --- Initialise DB Postprocessor
+    # Initialize DB Postprocessor
     db_postprocessor = DBPostProcess()
 
-    # --- Create triton client
+    # Create Triton Client & Check Models
     try:
         triton_client = httpclient.InferenceServerClient(url=TRITON_URL, verbose=False)
-        print(f"Checking Triton server liveness ({TRITON_URL})")
+        print(f"Checking Triton server Liveness ({TRITON_URL})...")
 
         if not triton_client.is_server_live:
             print(f"Error: Triton server is not live at {TRITON_URL}")
             exit()
         
         if not triton_client.is_model_ready(DET_MODEL_NAME):
-            print(f"Error: Detection mode '{DET_MODEL_NAME}' is not ready.")
-            exit()
-        
-        if not triton_client.is_model_ready(REC_MODEL_NAME):
-            print(f"Error: Recognition model '{REC_MODEL_NAME}' is not ready.")
-            exit()
-
-        print("Triton client created and models are ready")
+             print(f"Error: Detection model '{DET_MODEL_NAME}' is not ready.")
+             exit()
+        if not triton_client.is_model_ready(REC_MODEL_NAME): # Check the selected recognizer
+             print(f"Error: Recognition model '{REC_MODEL_NAME}' for lang '{TARGET_LANG}' is not ready.")
+             exit()
+        print("Triton client created and models are ready.")
     except Exception as e:
         print(f"Error creating triton client or checking models: {e}")
         exit()
@@ -311,7 +428,7 @@ if __name__ == "__main__":
     prep_det_time = time.time() - start_time
     print(f"Detection preprocessing time: {prep_det_time:.4f}s")
 
-    # ---- 2. Prepare Triton Request for Detection
+    # --- 2. Prepare Triton Request for Detection
     det_inputs = []
     det_outputs = []
     det_inputs.append(httpclient.InferInput(
@@ -322,7 +439,7 @@ if __name__ == "__main__":
     det_inputs[0].set_data_from_numpy(det_input_image)
     det_outputs.append(httpclient.InferRequestedOutput(DET_OUTPUT_NAME))
 
-
+    
     # --- 3. Run Detection Inference via Triton
     print(f"Sending request to Triton for model '{DET_MODEL_NAME}'...")
     start_time = time.time()
@@ -336,14 +453,14 @@ if __name__ == "__main__":
         exit()
 
     infer_det_time = time.time() - start_time
-    print(f"Triton detection inference time: {infer_det_time:.4f}s")
+    print(f"Tritin detection inference time: {infer_det_time:.4f}s")
 
-
-    # --- 4. Postprocess Detection Results (Using accurate DBPostProcess)
-    start_time = time.time()
+    # --- 4. Postporcess Detection Results (Using accurate DBPostProcess)
+    start_time = time.time()    
     detected_boxes_poly = db_postprocessor(det_output_raw, resize_info)
     post_det_time = time.time() - start_time
-    print(f"Detection postprocessin time: {post_det_time:.4f}s. Found {len(detected_boxes_poly)} boxes.")
+    print(f"Detection postprocessing time: {post_det_time:.4f}s. Found {len(detected_boxes_poly)} boxes.")
+
 
     # --- 5. Run Recognition for each detected box
     print("\n--- Running Recognition ---")
@@ -356,25 +473,30 @@ if __name__ == "__main__":
         total_rec_prep_time = 0
         total_rec_infer_time = 0
         total_rec_post_time = 0
-
         for i, box_poly_list in enumerate(detected_boxes_poly):
             box_poly = np.array(box_poly_list).astype(np.float32)
             if box_poly.shape != (4, 2):
                 print(f"Warning: Skipping box {i} due to unexpected shape {box_poly.shape} after postprocessing.")
                 continue
-            
-            print(f"\n--- Processing Box {i} ---")
-            img_crop = get_rotate_crop_image(img_orig, box_poly)
 
+            print(f"\n--- Processing Box {i} ---")            
+            img_crop = get_rotate_crop_image(img_orig, box_poly)
+            
             if img_crop is None or img_crop.shape[0] < 8 or img_crop.shape[1] < 8:
-                print(f"Warning: Skipping box {i} due to invalid crop (shape: {img_crop.shape if img_crop is not None else 'None'}).")
+                print(f"Warning: Skipping box {i} due to invalid crop (shape: {img_crop.shape if img_crop is not None else 'None'})")
                 continue
+            
+             # ===>>> DEBUGGING: Save the crop <<<===
+            debug_crop_filename = f'output/debug_crop_box_{i}_lang_{TARGET_LANG}.png'
+            cv2.imwrite(debug_crop_filename, img_crop)
+            print(f"  [Debug Crop] Saved debug crop for box {i} to {debug_crop_filename}")
+            # ===>>> END DEBUGGING <<<===
             
             print(f"Cropped image shape: {img_crop.shape}")
 
-            # Preprocess crop for Recognition
+            # Preprocess crop for Recognition (using potentially lang-specific height)
             start_time = time.time()
-            rec_input_image = preprocess_rec_image(img_crop)
+            rec_input_image = preprocess_rec_image(img_crop, REC_IMG_H) # Pass REC_IMG_H
             prep_rec_time = time.time() - start_time
             total_rec_prep_time += prep_rec_time
             rec_inputs = []
@@ -383,21 +505,21 @@ if __name__ == "__main__":
             rec_inputs[0].set_data_from_numpy(rec_input_image)
             rec_outputs.append(httpclient.InferRequestedOutput(REC_OUTPUT_NAME))
 
-            # Run Recognition Inference via Triton
+    
+
+            # Run Recognition Inference via Triton (using language-specific model)
             print(f"Sending request to Triton for model '{REC_MODEL_NAME}'...")
             start_time = time.time()
-            try:
+            try:                
                 rec_results = triton_client.infer(model_name=REC_MODEL_NAME, inputs=rec_inputs, outputs=rec_outputs)
                 rec_output_raw = rec_results.as_numpy(REC_OUTPUT_NAME)
             except Exception as e:
-                print(f"Error during recognition inference for box {i}: {e}")
-                continue
+                 print(f"Error during recognition inference for box {i}: {e}")
+                 continue
             infer_rec_time = time.time() - start_time
             total_rec_infer_time += infer_rec_time
 
-            print(f"Triton recognition inference time: {infer_rec_time:.4f}s")
-
-            # Postprocess Recognition Results (CTC Decode)
+            # Postprocess Recognition Results (using language-specific char_list)
             start_time = time.time()
             text, confidence = postprocess_recognition(rec_output_raw, char_list)
             post_rec_time = time.time() - start_time
@@ -411,14 +533,13 @@ if __name__ == "__main__":
                 'confidence': confidence
             })
 
-            # Draw on output image
             try:
                 cv2.polylines(output_image_final, [box_poly.astype(np.int32)], isClosed=True, color=(0, 0, 255), thickness=2)
                 label_pos = (int(box_poly[0][0]), int(box_poly[0][1]) - 10)
                 cv2.putText(output_image_final, f"{text} ({confidence:.2f})", label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
             except Exception as draw_e:
                 print(f"Error drawing results for box {i}: {draw_e}")
-    
+
         print("\n--- Timing Summary ---")
         print(f"Detection Prep : {prep_det_time:.4f}s")
         print(f"Detection Infer: {infer_det_time:.4f}s")
@@ -429,17 +550,15 @@ if __name__ == "__main__":
         print(f"Processed {len(all_ocr_results)} text instances via Triton.")
 
         print("\n OCR Output")
-        for i in all_ocr_results:
+        for i in all_ocr_results:            
             print(f"Text: {i["text"]}, Confidence: {i["confidence"]}")
-    
-    # Save the final image
-    output_filename = 'output/triton_ocr_final_output.png'
+
+    # Save the final image (include lang in filename)
+    output_filename = f'output/triton_ocr_final_output_{TARGET_LANG}.png'
     os.makedirs(os.path.dirname(output_filename), exist_ok=True)
     save_success = cv2.imwrite(output_filename, output_image_final)
     if save_success:
         print(f"\nOutput image with Triton results saved to {output_filename}")
     else:
         print(f"\nError saving final output image to {output_filename}")
-
     print("\nScript finished.")
-
