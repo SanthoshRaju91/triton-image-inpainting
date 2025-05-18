@@ -1,0 +1,32 @@
+name: "lama_inpainter"
+backend: "python"
+max_batch_size: 1
+
+
+input [
+  {
+    name: "IMAGE_IN" # Original image, preprocessed (e.g., normalized to [-1,1])
+    data_type: TYPE_FP32
+    dims: [ 3, -1, -1 ] # Channels, Height, Width (dynamic)
+  },
+  {
+    name: "MASK_IN" # Binary mask (0 for keep, 1 for hole), float32
+    data_type: TYPE_FP32
+    dims: [ 1, -1, -1 ] # 1 Channel, Height, Width (dynamic)
+  }
+]
+
+output [
+  {
+    name: "INPAINTED_OUT" # Inpainted image, likely normalized [-1,1] or [0,1]
+    data_type: TYPE_FP32
+    dims: [ 3, -1, -1 ] # Channels, Height, Width (dynamic)
+  }
+]
+
+instance_group [
+  {
+      count: 1
+      kind: KIND_CPU
+  }
+]
